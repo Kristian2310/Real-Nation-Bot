@@ -5,47 +5,28 @@ ACCENT = 0x5865F2
 
 async def create_leaderboard_embed(page: int = 1, per_page: int = 10) -> discord.Embed:
     rows = await db.get_leaderboard()
-
-    # 🔥 NEW: Collapse duplicate user_ids & keep the highest points
-    collapsed = {}
-    for user_id, pts in rows:
-        if user_id not in collapsed:
-            collapsed[user_id] = pts
-        else:
-            collapsed[user_id] = max(collapsed[user_id], pts)
-
-    # Convert collapsed dict → list of tuples
-    sorted_points = sorted(collapsed.items(), key=lambda x: x[1], reverse=True)
-
-    # Pagination
+    sorted_points = sorted(rows, key=lambda x: x[1], reverse=True)
     total_pages = max(1, (len(sorted_points) + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
     start = (page - 1) * per_page
     end = start + per_page
 
-    # Page slice
-    page_rows = sorted_points[start:end]
-
-    # Build display lines
     lines = []
     top_emojis = ["🥇", "🥈", "🥉"]
-    for idx, (user_id, pts) in enumerate(page_rows, start=start + 1):
+    for idx, (user_id, pts) in enumerate(sorted_points[start:end], start=start + 1):
         prefix = f"**#{idx}** "
         if idx <= 3:
-            prefix += top_emojis[idx - 1] + " "
+            prefix += f"{top_emojis[idx - 1]} "
         lines.append(f"{prefix}<@{user_id}>\n└ **{pts:,} points**")
 
     description = "\n".join(lines) if lines else "No entries yet."
-
     embed = discord.Embed(
         title="🏆 HELPER'S LEADERBOARD SEASON 7 🏆",
         description=description,
         color=ACCENT,
     )
     embed.set_footer(text=f"📄 Page {page}/{total_pages}")
-
     return embed
-
 
 
 class LeaderboardView(discord.ui.View):
@@ -83,4 +64,3 @@ class LeaderboardView(discord.ui.View):
         embed = await create_leaderboard_embed(self.current_page, self.per_page)
         self._sync_buttons()
         await interaction.response.edit_message(embed=embed, view=self)
-
