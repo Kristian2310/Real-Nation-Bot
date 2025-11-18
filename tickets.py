@@ -1,11 +1,12 @@
 import discord
 from discord.ext import commands
-from discord.ui import View, Button, Select, Modal, InputText
+from discord.ui import View, Button, Modal, InputText
 import logging
 from points import PointsModule
 from database import db
 from datetime import datetime
 from io import StringIO
+import urllib.parse
 
 # ---------- DEFAULTS ----------
 DEFAULT_POINT_VALUES = {
@@ -40,7 +41,7 @@ def parse_question_required(label: str):
     return cleaned, required
 
 # ---------- STORAGE ----------
-active_tickets = {}
+active_tickets: dict[int, dict] = {}
 logger = logging.getLogger(__name__)
 
 # ---------- PERMISSIONS ----------
@@ -204,7 +205,8 @@ class TicketModal(Modal):
 
             # Add helper slots
             for i in range(self.slots):
-                embed.add_field(name=f"👤 Helper Slot {i+1}", value="Empty", inline=True)
+                # Keep a consistent name so editing by index works later
+                embed.add_field(name=f"Helper Slot {i+1}", value="Empty", inline=True)
 
             roles_cfg = await db.get_roles()
             helper_role_id = roles_cfg.get("helper") if roles_cfg else None
@@ -300,6 +302,7 @@ class TicketView(View):
         super().__init__(timeout=None)
         self.category = category
         self.requestor_id = requestor_id
+        # Join and close buttons are handled centrally in the Cog.on_interaction
         self.add_item(Button(label="Join", style=discord.ButtonStyle.green, custom_id="join_ticket", emoji="➕"))
         self.add_item(Button(label="Close", style=discord.ButtonStyle.gray, custom_id="close_ticket", emoji="🧹"))
 
@@ -334,43 +337,20 @@ class RewardChoiceView(View):
         ticket_info["closed_stage"] = 2
         await interaction.response.send_message("Transcript generated without rewards. Click Close again to delete.", ephemeral=True)
 
-# ---------- SELECT MENU ----------
-class TicketSelect(Select):
-    def __init__(self, categories):
-        options = [discord.SelectOption(label=cat["name"]) for cat in categories]
-        super().__init__(placeholder="Choose ticket type...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        member_role_ids = [role.id for role in interaction.user.roles]
-        roles_cfg = await db.get_roles()
-        restricted_raw = roles_cfg.get("restricted", []) if roles_cfg else []
-        restricted_ids = []
-        for r in restricted_raw:
-            try:
-                restricted_ids.append(int(r))
-            except Exception:
-                pass
-        if any(rid in member_role_ids for rid in restricted_ids):
-            await interaction.response.send_message("You cannot open a ticket.", ephemeral=True)
-            return
-
-        if not bot_can_manage_channels(interaction):
-            await interaction.response.send_message(
-                "I need the 'Manage Channels' permission to create your ticket. Please ask an admin to grant it.",
-                ephemeral=True,
-            )
-            return
-
-        category_name = self.values[0]
-        cat_data = await db.get_category(category_name)
-        if not cat_data:
-            cat_data = get_fallback_category(category_name)
-        await interaction.response.send_modal(TicketModal(category_name, cat_data["questions"], interaction.user.id, cat_data["slots"]))
-
+# ---------- PANEL VIEW (BUTTONS) ----------
 class TicketPanelView(View):
+    """
+    A simple view that creates one button per category.
+    Uses custom_id 'open_ticket:<urlencoded category name>' so the Cog can handle modal opening.
+    """
     def __init__(self, categories):
         super().__init__(timeout=None)
-        self.add_item(TicketSelect(categories))
+        # discord allows up to 25 components total. We will add at most 25 buttons.
+        for cat in (categories or [])[:25]:
+            label = cat.get("name", "Unknown")[:80]
+            cid = f"open_ticket:{urllib.parse.quote_plus(cat.get('name',''))}"
+            # Use secondary/gray style for a muted look
+            self.add_item(Button(label=label, style=discord.ButtonStyle.grey, custom_id=cid))
 
 # ---------- COG ----------
 class TicketModule(commands.Cog):
@@ -405,26 +385,41 @@ class TicketModule(commands.Cog):
 
         categories = await db.get_categories()
         if not categories:
-            categories = [{
-                "name": name,
-                "questions": DEFAULT_QUESTIONS,
-                "points": DEFAULT_POINT_VALUES[name],
-                "slots": DEFAULT_HELPER_SLOTS.get(name, DEFAULT_SLOTS),
-            } for name in DEFAULT_POINT_VALUES.keys()]
+            # Build fallback categories from defaults
+            categories = [
+                {
+                    "name": name,
+                    "questions": DEFAULT_QUESTIONS,
+                    "points": DEFAULT_POINT_VALUES.get(name, 0),
+                    "slots": DEFAULT_HELPER_SLOTS.get(name, DEFAULT_SLOTS),
+                }
+                for name in DEFAULT_POINT_VALUES.keys()
+            ]
+
         panel_cfg = await db.get_panel_config()
         view = TicketPanelView(categories)
         embed = discord.Embed(
-            title="🎮 In-game Assistance",
+            title=panel_cfg.get("title", "🎮 In-game Assistance"),
             description=panel_cfg.get("text", "Select a service below to create a help ticket. Our helpers will assist you!"),
             color=panel_cfg.get("color", 0x5865F2),
         )
+
         services = [f"- **{cat['name']}** — {cat.get('points', 0)} points" for cat in categories]
         embed.add_field(name="📋 Available Services", value="**" + ("\n".join(services) or "No services configured") + "**", inline=False)
         embed.add_field(
             name="ℹ️ How it works",
-            value="1. Select a service\n2. Fill out the form\n3. Helpers join\n4. Get help in your private ticket!",
+            value="1. Click a service button\n2. Fill out the form\n3. Helpers join\n4. Get help in your private ticket!",
             inline=False,
         )
+
+        # Optional thumbnail/icon support
+        icon_url = panel_cfg.get("icon_url")
+        if icon_url:
+            try:
+                embed.set_thumbnail(url=icon_url)
+            except Exception:
+                pass
+
         await ctx.respond(embed=embed, view=view)
 
     @commands.slash_command(name="ticket_kick", description="Remove a user from ticket embed; optionally from channel")
@@ -481,14 +476,58 @@ class TicketModule(commands.Cog):
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
+        # Only handle component interactions centrally here
         if interaction.type != discord.InteractionType.component:
             return
+
+        # Panel open buttons (open_ticket:<urlencoded name>)
+        cid = interaction.data.get("custom_id", "")
+        if cid.startswith("open_ticket:"):
+            # User clicked a panel button → open modal for that category
+            raw_name = urllib.parse.unquote_plus(cid.split("open_ticket:", 1)[1])
+            # Check restrictions and maintenance and permissions like before
+            member_role_ids = [r.id for r in interaction.user.roles]
+            roles_cfg = await db.get_roles()
+            restricted_raw = roles_cfg.get("restricted", []) if roles_cfg else []
+            restricted_ids = []
+            for r in restricted_raw:
+                try:
+                    restricted_ids.append(int(r))
+                except Exception:
+                    pass
+            if any(rid in member_role_ids for rid in restricted_ids):
+                await interaction.response.send_message("You cannot open a ticket.", ephemeral=True)
+                return
+
+            if not bot_can_manage_channels(interaction):
+                await interaction.response.send_message(
+                    "I need the 'Manage Channels' permission to create your ticket. Please ask an admin to grant it.",
+                    ephemeral=True,
+                )
+                return
+
+            category_name = raw_name
+            cat_data = await db.get_category(category_name)
+            if not cat_data:
+                cat_data = get_fallback_category(category_name)
+            # present the modal
+            try:
+                await interaction.response.send_modal(TicketModal(category_name, cat_data["questions"], interaction.user.id, cat_data["slots"]))
+            except Exception as e:
+                logger.exception("Failed to send modal: %s", e)
+                try:
+                    await interaction.response.send_message("Unable to open ticket form. Please contact staff.", ephemeral=True)
+                except Exception:
+                    pass
+            return  # handled
+
+        # For ticket-specific components (join, close, reward, etc) we need ticket context
         channel_id = interaction.channel.id
         ticket_info = active_tickets.get(channel_id)
         if not ticket_info:
             return
 
-        custom_id = interaction.data["custom_id"]
+        custom_id = cid
 
         if custom_id == "join_ticket":
             if interaction.user.id == ticket_info["requestor"]:
@@ -541,7 +580,7 @@ class TicketModule(commands.Cog):
                     color=discord.Color.blurple(),
                 )
                 priv.add_field(name="Requester", value=requester_text, inline=False)
-                priv.add_field(name="In‑game name", value=in_game, inline=True)
+                priv.add_field(name="In-game name", value=in_game, inline=True)
                 priv.add_field(name="Server name", value=server_name, inline=True)
                 priv.add_field(name="Room", value=room, inline=False)
                 if anything_else and anything_else != "—":
@@ -616,6 +655,9 @@ class TicketModule(commands.Cog):
                     await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
                 except Exception:
                     pass
+
+        # reward buttons are handled by RewardChoiceView's callbacks (they create their own interaction responses)
+        # nothing more to do here
 
 def setup(bot):
     bot.add_cog(TicketModule(bot))
